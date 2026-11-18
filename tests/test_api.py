@@ -93,3 +93,26 @@ def test_cross_midnight_correction_via_api(client):
     assert day1["status"] == day2["status"] == "current"
     assert [(p["from_station"], p["to_station"]) for p in day1["station_pairs"]] == [("A", "D")]
     assert day2["trip_total"] == 0
+
+
+def test_api_exposes_change_explanation(client):
+    upload(client, [
+        tap("e1", "c1", "2024-05-01T08:00:00Z", "A", "in"),
+        tap("e2", "c1", "2024-05-01T08:20:00Z", "B", "out"),
+    ])
+    first = client.get("/api/days/2024-05-01").json()
+    assert first["changes"]["has_baseline"] is False
+    assert first["changes"]["journeys"][0]["kind"] == "added"
+
+    upload(client, [tap("e2", "c1", "2024-05-01T08:20:00Z", "C", "out", revision=1)])
+    detail = client.get("/api/days/2024-05-01").json()
+    assert detail["status"] == "current"
+    changes = detail["changes"]
+    assert changes["has_baseline"] is True
+    assert changes["baseline_computed_at"] is not None
+    pairs = {(p["from_station"], p["to_station"]): (p["before_trips"], p["after_trips"])
+             for p in changes["pairs"]}
+    assert pairs == {("A", "B"): (1, 0), ("A", "C"): (0, 1)}
+    assert {j["kind"] for j in changes["journeys"]} == {"added", "removed"}
+    assert {j["exit_event_no"] for j in changes["journeys"]} == {"e2"}
+    assert detail["trip_total"] == 1

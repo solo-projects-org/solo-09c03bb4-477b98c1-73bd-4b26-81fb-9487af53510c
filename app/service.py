@@ -113,6 +113,13 @@ def _day_epoch(conn: sqlite3.Connection, day: str) -> int:
     return int(row["epoch"]) if row else 0
 
 
+def _day_publish_seq(conn: sqlite3.Connection, day: str) -> int:
+    row = conn.execute(
+        "SELECT publish_seq FROM day_state WHERE service_date = ?", (day,)
+    ).fetchone()
+    return int(row["publish_seq"]) if row else 0
+
+
 def _stale_days(
     conn: sqlite3.Connection, days: Iterable[str], reason: str, published_batch_bumps: bool = True
 ) -> None:
@@ -133,6 +140,12 @@ def _stale_days(
             "  last_error = excluded.last_error, updated_at = excluded.updated_at",
             (day, epoch, reason, now),
         )
+        # The explanation described the superseded numbers; drop it right away.
+        # ``published_journeys`` is *not* touched: it is the last published
+        # baseline the next publication must compare against.
+        conn.execute("DELETE FROM day_changes WHERE service_date = ?", (day,))
+        conn.execute("DELETE FROM change_pairs WHERE service_date = ?", (day,))
+        conn.execute("DELETE FROM change_journeys WHERE service_date = ?", (day,))
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +350,8 @@ def _run_job(
     attempts = int(job["attempts"])
 
     captured: dict[str, int] = {}
+    captured_seq: dict[str, int] = {}
+    baselines: dict[str, DaySnapshot] = {}
     publish_days: list[str] = list(days)
     try:
         with db.snapshot(conn):
@@ -349,8 +364,16 @@ def _run_job(
             publish_set = set(publish_days)
             for day in publish_days:
                 captured[day] = _day_epoch(conn, day)
+            # The comparison baseline is the last *published* state of each
+            # date, read in this same snapshot.  It survives invalidation, so
+            # several uploads accepted before this recompute are collapsed into
+            # one comparison against the last result the crew actually saw.
+            baselines = load_published(conn, publish_days)
+            captured_seq = {day: baselines[day].publish_seq for day in publish_days}
             result_rows = _aggregate(journeys, publish_set)
             pending_rows = [p for p in pending if p.service_date in publish_set]
+            published_journeys = {day: [j for j in journeys if j.service_date == day]
+                                  for day in publish_days}
 
         if hook:
             hook("after_compute", conn, {"job_id": job_id, "days": publish_days})
@@ -358,7 +381,13 @@ def _run_job(
         with db.transaction(conn):
             if {day: _day_epoch(conn, day) for day in publish_days} != captured:
                 raise StaleDataError("重算期间收到新数据，放弃本次发布并重试")
-            _publish(conn, job, publish_days, captured, result_rows, pending_rows)
+            # A competing publication of the same date invalidates the baseline
+            # this computation compared against: its explanation would describe
+            # a superseded state.  Refuse to publish the stale comparison.
+            if {day: _day_publish_seq(conn, day) for day in publish_days} != captured_seq:
+                raise StaleDataError("重算期间该日已被重新发布，放弃旧的变动说明并重试")
+            _publish(conn, job, publish_days, captured, baselines, result_rows,
+                     pending_rows, published_journeys)
 
         if hook:
             hook("after_publish", conn, {"job_id": job_id, "days": publish_days})
@@ -369,13 +398,24 @@ def _run_job(
 
 
 def _linked_days(days: Iterable[str], journeys: list[Journey]) -> list[str]:
-    """Close the day set over journeys whose two ends fall on different days."""
+    """Close the day set over journeys whose two ends fall on different days.
+
+    Applied to a fixpoint: a cross-midnight pair on day N/N+1 can chain with
+    another pair starting on N+1, so one pass is not enough when only one date
+    is being repaired.
+    """
     result = set(days)
-    for journey in journeys:
-        if journey.service_date in result or journey.exit_date in result:
-            result.add(journey.service_date)
-            result.add(journey.exit_date)
-    return sorted(result)
+    while True:
+        added = {
+            end
+            for journey in journeys
+            if journey.service_date in result or journey.exit_date in result
+            for end in (journey.service_date, journey.exit_date)
+            if end not in result
+        }
+        if not added:
+            return sorted(result)
+        result |= added
 
 
 def _publish(
@@ -383,13 +423,25 @@ def _publish(
     job: sqlite3.Row,
     days: list[str],
     epochs: dict[str, int],
+    baselines: dict[str, DaySnapshot],
     results: Counter,
     pending_rows: list[PendingTap],
+    published_journeys: dict[str, list[Journey]],
 ) -> None:
+    """Publish results, pending taps, journeys and their change explanation.
+
+    Everything happens in the caller's write transaction, under the epoch and
+    publish-sequence fences.  Old results/pending/evidence/journal rows for the
+    affected dates are deleted first, so no reader can observe a mixture of the
+    new numbers and the old explanation.
+    """
     now = utcnow()
+    publish_seq = _next_publish_seq(conn)
     for day in days:
         conn.execute("DELETE FROM results WHERE service_date = ?", (day,))
         conn.execute("DELETE FROM pending_taps WHERE service_date = ?", (day,))
+        conn.execute("DELETE FROM published_journeys WHERE service_date = ?", (day,))
+        # day_changes/change_pairs/change_journeys are replaced by _write_change.
     for (day, src, dst), trips in sorted(results.items()):
         conn.execute(
             "INSERT INTO results (service_date, from_station, to_station, trips, batch_id, computed_at) "
@@ -407,14 +459,29 @@ def _publish(
             ),
         )
     for day in days:
+        for j in published_journeys.get(day, []):
+            conn.execute(
+                "INSERT INTO published_journeys (service_date, card_id, entry_event_no, "
+                "  exit_event_no, from_station, to_station, exit_date, batch_id, published_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (day, j.card_id, j.entry_event_no, j.exit_event_no,
+                 j.from_station, j.to_station, j.exit_date, job["trigger_batch_id"], now),
+            )
+    for day in days:
         conn.execute(
-            "INSERT INTO day_state (service_date, status, published_batch_id, computed_at, data_epoch, last_error, updated_at) "
-            "VALUES (?, 'current', ?, ?, ?, NULL, ?) "
+            "INSERT INTO day_state (service_date, status, published_batch_id, computed_at, "
+            "  data_epoch, publish_seq, last_error, updated_at) "
+            "VALUES (?, 'current', ?, ?, ?, ?, NULL, ?) "
             "ON CONFLICT(service_date) DO UPDATE SET "
             "  status = 'current', published_batch_id = excluded.published_batch_id, "
             "  computed_at = excluded.computed_at, data_epoch = excluded.data_epoch, "
-            "  last_error = NULL, updated_at = excluded.updated_at",
-            (day, job["trigger_batch_id"], now, epochs[day], now),
+            "  publish_seq = excluded.publish_seq, last_error = NULL, "
+            "  updated_at = excluded.updated_at",
+            (day, job["trigger_batch_id"], now, epochs[day], publish_seq, now),
+        )
+        _write_change(
+            conn, day, baselines[day], published_journeys.get(day, []),
+            publish_seq, epochs[day], now,
         )
     conn.execute(
         "UPDATE recompute_jobs SET status = 'done', finished_at = ?, last_error = NULL WHERE id = ?",
@@ -491,6 +558,15 @@ def recover(db_path: str | Path) -> None:
                 )
                 conn.execute("DELETE FROM results WHERE service_date = ?", (day,))
                 conn.execute("DELETE FROM pending_taps WHERE service_date = ?", (day,))
+            # ``published_journeys`` is the last published baseline and is kept:
+            # the next successful publish compares against it.  Everything that
+            # presents itself as a *current* explanation is only valid while the
+            # date is current, so scrub any evidence attached to a stale date.
+            for table in ("day_changes", "change_pairs", "change_journeys"):
+                conn.execute(
+                    f"DELETE FROM {table} WHERE service_date IN "
+                    "(SELECT service_date FROM day_state WHERE status = 'stale')"
+                )
             _ensure_stale_jobs(conn)
     finally:
         conn.close()
@@ -534,8 +610,159 @@ def request_recompute(db_path: str | Path, days: list[str]) -> int | None:
 
 
 # ---------------------------------------------------------------------------
-# read models for the web UI
+# change explanation
 # ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DaySnapshot:
+    """Journeys published for one service date, as of one publication."""
+
+    journeys: frozenset[Journey]
+    batch_id: int | None
+    computed_at: str | None
+    publish_seq: int
+
+    @property
+    def pairs(self) -> Counter:
+        return Counter((j.from_station, j.to_station) for j in self.journeys)
+
+    @property
+    def has_baseline(self) -> bool:
+        return self.publish_seq > 0
+
+
+def load_published(conn: sqlite3.Connection, days: Iterable[str]) -> dict[str, DaySnapshot]:
+    """Read the last *published* journeys/baseline for ``days``.
+
+    ``day_state`` is read unconditionally: an invalidated (``stale``) date still
+    holds the last published baseline, which is exactly what the next
+    publication must be compared against.
+    """
+    out: dict[str, DaySnapshot] = {}
+    for day in sorted(set(days)):
+        state = conn.execute(
+            "SELECT published_batch_id, computed_at, publish_seq FROM day_state "
+            "WHERE service_date = ?",
+            (day,),
+        ).fetchone()
+        rows = conn.execute(
+            "SELECT card_id, entry_event_no, exit_event_no, from_station, to_station, exit_date "
+            "FROM published_journeys WHERE service_date = ?",
+            (day,),
+        ).fetchall()
+        journeys = frozenset(
+            Journey(
+                card_id=row["card_id"],
+                entry_event_no=row["entry_event_no"],
+                exit_event_no=row["exit_event_no"],
+                service_date=day,
+                exit_date=row["exit_date"],
+                from_station=row["from_station"],
+                to_station=row["to_station"],
+            )
+            for row in rows
+        )
+        out[day] = DaySnapshot(
+            journeys=journeys,
+            batch_id=state["published_batch_id"] if state else None,
+            computed_at=state["computed_at"] if state else None,
+            publish_seq=int(state["publish_seq"]) if state else 0,
+        )
+    return out
+
+
+def _next_publish_seq(conn: sqlite3.Connection) -> int:
+    current = int(db.get_state(conn, "publish_seq", "0") or "0")
+    new = current + 1
+    db.set_state(conn, "publish_seq", str(new))
+    return new
+
+
+def _write_change(
+    conn: sqlite3.Connection,
+    day: str,
+    snapshot: DaySnapshot,
+    journeys: list[Journey],
+    publish_seq: int,
+    epoch: int,
+    now: str,
+) -> None:
+    """Write the explanation for one date inside the publish transaction.
+
+    A *journey* is identified by card + entry/exit event numbers + stations, so
+    a revision that only moves a tap's timestamp keeps the same identity but a
+    re-paired tap appears once as removed and once as added.  When a day's
+    net delta is zero the added/removed lists are still written.
+
+    Whatever the number of uploads accepted between two publications, the
+    comparison is against the last published state, because ``snapshot`` is
+    read from ``published_journeys``/``day_state`` and is not reset on
+    invalidation.
+
+    Carry-forward: if another worker already published a comparison for the
+    *same* data epoch (it raced us and won the fence), that explanation is
+    still the correct one for the operator.  Rewriting it as "no change since
+    the intervening publish" would hide a correction the crew never saw, so
+    the existing baseline and evidence are kept and only the publication
+    bookkeeping is refreshed.  Evidence written for a different epoch is
+    always overwritten.
+    """
+    existing = conn.execute(
+        "SELECT data_epoch FROM day_changes WHERE service_date = ?", (day,)
+    ).fetchone()
+    if existing is not None and int(existing["data_epoch"]) == epoch:
+        conn.execute(
+            "UPDATE day_changes SET publish_seq = ?, computed_at = ? WHERE service_date = ?",
+            (publish_seq, now, day),
+        )
+        return
+
+    before = snapshot.pairs
+    after_set = frozenset(journeys)
+    after = Counter((j.from_station, j.to_station) for j in journeys)
+    added = sorted(
+        (j for j in after_set if j not in snapshot.journeys),
+        key=lambda j: (j.from_station, j.to_station, j.entry_event_no, j.exit_event_no),
+    )
+    removed = sorted(
+        (j for j in snapshot.journeys if j not in after_set),
+        key=lambda j: (j.from_station, j.to_station, j.entry_event_no, j.exit_event_no),
+    )
+
+    conn.execute(
+        "INSERT INTO day_changes (service_date, publish_seq, data_epoch, has_baseline, "
+        "  baseline_batch_id, baseline_computed_at, added_count, removed_count, computed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(service_date) DO UPDATE SET "
+        "  publish_seq = excluded.publish_seq, data_epoch = excluded.data_epoch, "
+        "  has_baseline = excluded.has_baseline, baseline_batch_id = excluded.baseline_batch_id, "
+        "  baseline_computed_at = excluded.baseline_computed_at, "
+        "  added_count = excluded.added_count, removed_count = excluded.removed_count, "
+        "  computed_at = excluded.computed_at",
+        (
+            day, publish_seq, epoch, int(snapshot.has_baseline),
+            snapshot.batch_id, snapshot.computed_at, len(added), len(removed), now,
+        ),
+    )
+    conn.execute("DELETE FROM change_pairs WHERE service_date = ?", (day,))
+    for (src, dst) in sorted(set(before) | set(after)):
+        b, a = before[(src, dst)], after[(src, dst)]
+        conn.execute(
+            "INSERT INTO change_pairs (service_date, from_station, to_station, "
+            "  before_trips, after_trips, delta) VALUES (?, ?, ?, ?, ?, ?)",
+            (day, src, dst, b, a, a - b),
+        )
+    conn.execute("DELETE FROM change_journeys WHERE service_date = ?", (day,))
+    for kind, items in (("added", added), ("removed", removed)):
+        for j in items:
+            conn.execute(
+                "INSERT INTO change_journeys (service_date, kind, card_id, entry_event_no, "
+                "  exit_event_no, from_station, to_station, exit_date) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (day, kind, j.card_id, j.entry_event_no, j.exit_event_no,
+                 j.from_station, j.to_station, j.exit_date),
+            )
+
 
 def known_days(conn: sqlite3.Connection) -> list[dict]:
     """Service dates and their publication state.
@@ -554,10 +781,23 @@ def known_days(conn: sqlite3.Connection) -> list[dict]:
 
 
 def day_detail(conn: sqlite3.Connection, day: str) -> dict:
+    """Published numbers, pending taps and their explanation as one snapshot.
+
+    Numbers and evidence are written together, but they are separate reads here;
+    a ``BEGIN`` makes the whole panel a single WAL snapshot so a publish that
+    commits midway cannot pair new numbers with an old explanation (or the
+    reverse).
+    """
+    with db.snapshot(conn):
+        return _day_detail(conn, day)
+
+
+def _day_detail(conn: sqlite3.Connection, day: str) -> dict:
     state = conn.execute("SELECT * FROM day_state WHERE service_date = ?", (day,)).fetchone()
     status = state["status"] if state else "uncomputed"
     results = []
     pending = []
+    changes = None
     if status == "current":
         results = [dict(row) for row in conn.execute(
             "SELECT from_station, to_station, trips, computed_at FROM results "
@@ -569,6 +809,7 @@ def day_detail(conn: sqlite3.Connection, day: str) -> dict:
             "WHERE service_date = ? ORDER BY tap_time, event_no",
             (day,),
         ).fetchall()]
+        changes = _changes_for_current(conn, day, state)
     return {
         "date": day,
         "status": status,
@@ -578,6 +819,47 @@ def day_detail(conn: sqlite3.Connection, day: str) -> dict:
         "station_pairs": results,
         "pending": pending,
         "pending_total": len(pending),
+        "changes": changes,
+    }
+
+
+def _changes_for_current(conn: sqlite3.Connection, day: str, state: sqlite3.Row) -> dict:
+    """Return the change explanation only if it belongs to this publication.
+
+    The evidence carries the epoch and publish sequence it was written with.
+    A mismatch means it describes superseded numbers; it is withheld rather
+    than shown alongside the current ones.
+    """
+    change = conn.execute(
+        "SELECT * FROM day_changes WHERE service_date = ?", (day,)
+    ).fetchone()
+    if (
+        change is None
+        or int(change["data_epoch"]) != int(state["data_epoch"])
+        or int(change["publish_seq"]) != int(state["publish_seq"])
+    ):
+        return None
+    pairs = [dict(row) for row in conn.execute(
+        "SELECT from_station, to_station, before_trips, after_trips, delta "
+        "FROM change_pairs WHERE service_date = ? "
+        "ORDER BY delta DESC, from_station, to_station",
+        (day,),
+    ).fetchall()]
+    events = [dict(row) for row in conn.execute(
+        "SELECT kind, card_id, entry_event_no, exit_event_no, from_station, to_station, exit_date "
+        "FROM change_journeys WHERE service_date = ? "
+        "ORDER BY kind, from_station, to_station, entry_event_no, exit_event_no",
+        (day,),
+    ).fetchall()]
+    return {
+        "has_baseline": bool(change["has_baseline"]),
+        "baseline_batch_id": change["baseline_batch_id"],
+        "baseline_computed_at": change["baseline_computed_at"],
+        "compared_at": change["computed_at"],
+        "added_count": change["added_count"],
+        "removed_count": change["removed_count"],
+        "pairs": pairs,
+        "journeys": events,
     }
 
 

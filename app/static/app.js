@@ -19,6 +19,74 @@ function esc(text) {
   }[c]));
 }
 
+function pairLabel(row) {
+  return `${esc(row.from_station)} → ${esc(row.to_station)}`;
+}
+
+function signed(n) {
+  return n > 0 ? `+${n}` : String(n);
+}
+
+function renderChanges(changes) {
+  if (!changes) {
+    return `<h3>客流变动说明</h3><div class="notice stale">本日客流变动说明不可用（人数与说明必须同时发布）。</div>`;
+  }
+  const head = `
+    <h3>客流变动说明 <span class="small muted">（按进站 UTC 日）</span></h3>
+    <p class="small muted">
+      对照上一次现行发布${
+        changes.has_baseline
+          ? `（批次 #${esc(changes.baseline_batch_id)}，计算于 ${esc(changes.baseline_computed_at)}）`
+          : ""
+      }
+      与本次发布（计算于 ${esc(changes.compared_at)}）。
+    </p>`;
+  if (!changes.has_baseline) {
+    return head + `<div class="notice uncomputed">本日首次发布，没有可对照的上一版现行结果。</div>`;
+  }
+
+  const changedPairs = changes.pairs.filter((p) => p.delta !== 0);
+  const unchangedPairs = changes.pairs.length - changedPairs.length;
+  const pairRows = changes.pairs.map((p) => `
+    <tr class="${p.delta === 0 ? "muted-row" : ""}">
+      <td>${pairLabel(p)}</td>
+      <td class="num">${p.before_trips}</td>
+      <td class="num">${p.after_trips}</td>
+      <td class="num ${p.delta > 0 ? "up" : p.delta < 0 ? "down" : ""}">${signed(p.delta)}</td>
+    </tr>`).join("");
+
+  const journeyRows = changes.journeys.map((j) => `
+    <tr>
+      <td><span class="badge ${j.kind}">${j.kind === "added" ? "新增" : "撤去"}</span></td>
+      <td>${pairLabel(j)}</td>
+      <td class="mono">${esc(j.entry_event_no)} → ${esc(j.exit_event_no)}</td>
+      <td class="mono">${esc(j.card_id)}</td>
+      <td class="mono">${esc(j.exit_date)}${j.exit_date !== changes.__date ? ' <span class="small">跨日</span>' : ""}</td>
+    </tr>`).join("");
+
+  const offsetNotice = changes.journeys.length && changedPairs.length === 0
+    ? `<div class="notice uncomputed">站间人数净增减为 0，但有 ${changes.journeys.length} 条行程被替换（${changes.added_count} 新增 / ${changes.removed_count} 撤去），已逐条列出。</div>`
+    : "";
+
+  return head + offsetNotice + `
+    <div class="stat-row">
+      <div class="stat"><div class="k">变动区间</div><div class="v">${changedPairs.length}</div></div>
+      <div class="stat"><div class="k">新增行程</div><div class="v">${changes.added_count}</div></div>
+      <div class="stat"><div class="k">撤去行程</div><div class="v">${changes.removed_count}</div></div>
+    </div>
+    <h4>各站间人数净增减</h4>
+    <table class="grid">
+      <thead><tr><th>区间</th><th class="num">上次</th><th class="num">本次</th><th class="num">净增减</th></tr></thead>
+      <tbody>${pairRows || '<tr><td colspan="4" class="empty">当日无站间人数</td></tr>'}</tbody>
+    </table>
+    ${unchangedPairs ? `<p class="small muted">另有 ${unchangedPairs} 个区间人数未变。</p>` : ""}
+    <h4>新增 / 撤去行程</h4>
+    <table class="grid">
+      <thead><tr><th>类型</th><th>区间</th><th>进出站事件号</th><th>卡号</th><th>出站日</th></tr></thead>
+      <tbody>${journeyRows || '<tr><td colspan="5" class="empty">本次行程明细无变化</td></tr>'}</tbody>
+    </table>`;
+}
+
 function renderDay(data) {
   const panel = $("#day-panel");
   panel.hidden = false;
@@ -31,7 +99,7 @@ function renderDay(data) {
 
   if (data.status !== "current") {
     const msg = data.status === "stale"
-      ? `结果已过期，不能用于排班。${data.last_error ? "原因：" + esc(data.last_error) : ""} 请在下方触发重算。`
+      ? `结果已过期，不能用于排班。上次的客流变动说明同时作废。${data.last_error ? " 原因：" + esc(data.last_error) : ""} 请在下方触发重算。`
       : "该日尚未计算完成。";
     panel.innerHTML = head + `<div class="notice ${data.status}">${msg}</div>` +
       `<button class="recompute" data-date="${esc(data.date)}">重算 ${esc(data.date)}</button>`;
@@ -40,7 +108,7 @@ function renderDay(data) {
   }
 
   const pairs = data.station_pairs.map((row) => `
-    <tr><td>${esc(row.from_station)} → ${esc(row.to_station)}</td>
+    <tr><td>${pairLabel(row)}</td>
         <td class="num">${row.trips}</td></tr>`).join("");
   const pending = data.pending.map((row) => `
     <tr><td class="mono">${esc(row.card_id)}</td>
@@ -49,6 +117,7 @@ function renderDay(data) {
         <td>${row.direction === "in" ? "进站" : "出站"}</td>
         <td class="small">${esc(row.reason)}</td></tr>`).join("");
 
+  const changes = data.changes ? { ...data.changes, __date: data.date } : null;
   panel.innerHTML = head + `
     <div class="stat-row">
       <div class="stat"><div class="k">配对行程</div><div class="v">${data.trip_total}</div></div>
@@ -70,7 +139,8 @@ function renderDay(data) {
           <tbody>${pending || '<tr><td colspan="5" class="empty">当日无待核记录</td></tr>'}</tbody>
         </table>
       </div>
-    </div>`;
+    </div>
+    <section class="changes">${renderChanges(changes)}</section>`;
   bindRecompute();
 }
 

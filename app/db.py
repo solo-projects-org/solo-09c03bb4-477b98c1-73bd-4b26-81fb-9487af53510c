@@ -16,6 +16,20 @@ Model
   stops a slow recompute from publishing over newer data.
 * ``recompute_jobs`` – durable outbox.  Uploads only enqueue; only a
   successfully committed computation flips day states to ``current``.
+* ``published_journeys`` / ``published_days`` – the journey-level snapshot of
+  the last *successful* publication per service date.  It is deliberately not
+  touched when an upload invalidates a date: the next publication must explain
+  the change relative to the last published result, however many uploads were
+  accepted in between.
+* ``day_changes`` / ``change_pairs`` / ``change_journeys`` – the explanation
+  attached to the current publication: per-pair before/after/delta plus the
+  added and removed journeys (with their entry/exit event numbers).  These
+  rows are written in the same transaction as the new results and carry the
+  epoch plus publish sequence they belong to, so stale evidence can never be
+  served.
+* ``day_state.publish_seq`` – monotonic counter bumped by every successful
+  publication (including a republish without new uploads).  A recompute that
+  snapshotted an older publication baseline cannot publish over a newer one.
 """
 
 from __future__ import annotations
@@ -84,6 +98,7 @@ CREATE TABLE IF NOT EXISTS day_state (
     published_batch_id INTEGER REFERENCES batches(id),
     computed_at        TEXT,
     data_epoch         INTEGER NOT NULL DEFAULT 0,
+    publish_seq        INTEGER NOT NULL DEFAULT 0,
     last_error         TEXT,
     updated_at         TEXT NOT NULL
 );
@@ -92,6 +107,55 @@ CREATE TABLE IF NOT EXISTS day_epochs (
     service_date TEXT PRIMARY KEY,
     epoch        INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS published_journeys (
+    service_date   TEXT    NOT NULL,
+    card_id        TEXT    NOT NULL,
+    entry_event_no TEXT    NOT NULL,
+    exit_event_no  TEXT    NOT NULL,
+    from_station   TEXT    NOT NULL,
+    to_station     TEXT    NOT NULL,
+    exit_date      TEXT    NOT NULL,
+    batch_id       INTEGER REFERENCES batches(id),
+    published_at   TEXT    NOT NULL,
+    PRIMARY KEY (service_date, entry_event_no, exit_event_no, from_station, to_station)
+);
+CREATE INDEX IF NOT EXISTS idx_published_journeys_day ON published_journeys (service_date);
+
+CREATE TABLE IF NOT EXISTS day_changes (
+    service_date          TEXT PRIMARY KEY,
+    publish_seq           INTEGER NOT NULL,
+    data_epoch            INTEGER NOT NULL,
+    has_baseline          INTEGER NOT NULL,
+    baseline_batch_id     INTEGER REFERENCES batches(id),
+    baseline_computed_at  TEXT,
+    added_count           INTEGER NOT NULL DEFAULT 0,
+    removed_count         INTEGER NOT NULL DEFAULT 0,
+    computed_at           TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS change_pairs (
+    service_date TEXT    NOT NULL,
+    from_station TEXT    NOT NULL,
+    to_station   TEXT    NOT NULL,
+    before_trips INTEGER NOT NULL,
+    after_trips  INTEGER NOT NULL,
+    delta        INTEGER NOT NULL,
+    PRIMARY KEY (service_date, from_station, to_station)
+);
+
+CREATE TABLE IF NOT EXISTS change_journeys (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    service_date   TEXT    NOT NULL,
+    kind           TEXT    NOT NULL CHECK (kind IN ('added', 'removed')),
+    card_id        TEXT    NOT NULL,
+    entry_event_no TEXT    NOT NULL,
+    exit_event_no  TEXT    NOT NULL,
+    from_station   TEXT    NOT NULL,
+    to_station     TEXT    NOT NULL,
+    exit_date      TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_change_journeys_day ON change_journeys (service_date);
 
 CREATE TABLE IF NOT EXISTS recompute_jobs (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -129,6 +193,27 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _migrate(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Small in-place upgrades for databases created before a schema change."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(day_state)")}
+    if "publish_seq" not in columns:
+        conn.execute(
+            "ALTER TABLE day_state ADD COLUMN publish_seq INTEGER NOT NULL DEFAULT 0"
+        )
+        # A legacy ``current`` row was published without journey-level evidence;
+        # it cannot support a trustworthy comparison, so demote it.  ``recover``
+        # re-queues every stale date, so the next start republishes it with a
+        # baseline.  Never leave it readable as current in the meantime.
+        conn.execute(
+            "UPDATE day_state SET status = 'stale', published_batch_id = NULL, "
+            "computed_at = NULL, "
+            "last_error = '升级后需重算以生成客流变动说明', "
+            "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') "
+            "WHERE status = 'current' AND publish_seq = 0"
+        )
 
 
 @contextmanager

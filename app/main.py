@@ -4,7 +4,8 @@ Routes
 ------
 GET  /                      dashboard (day list, uploads, jobs)
 GET  /api/days             list of known service dates with publication state
-GET  /api/days/{date}      station-pair counts + pending taps for one date
+GET  /api/days/{date}      station-pair counts, pending taps and the change
+                           explanation for one date
 POST /api/uploads          multipart CSV upload; accepted, dates invalidated,
                            then recompute is attempted inline
 POST /api/recompute        re-queue dates (repair after a failed recompute)
